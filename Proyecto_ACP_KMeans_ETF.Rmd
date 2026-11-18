@@ -1,0 +1,763 @@
+---
+title: "Segmentación de activos financieros según su riesgo y rendimiento"
+subtitle: "Aplicación del Análisis de Componentes Principales (ACP) y K-Means"
+author: "Estudiante de Finanzas"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: readable
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 9,
+  fig.height = 5.5
+)
+
+# Instala únicamente los paquetes que todavía no estén disponibles.
+paquetes <- c(
+  "quantmod", "tidyverse", "PerformanceAnalytics",
+  "FactoMineR", "factoextra", "cluster", "corrplot",
+  "knitr", "scales"
+)
+
+faltantes <- paquetes[!paquetes %in% rownames(installed.packages())]
+if (length(faltantes) > 0) {
+  install.packages(faltantes, repos = "https://cloud.r-project.org")
+}
+
+invisible(lapply(paquetes, library, character.only = TRUE))
+```
+
+# Introducción
+
+Los mercados financieros ofrecen diferentes alternativas de inversión. Cada activo tiene características propias que pueden influir en su comportamiento y en el nivel de riesgo que representa. Algunos presentan cambios más fuertes en sus precios, mientras que otros suelen tener un comportamiento más estable. Por eso, comparar sus características puede ayudar a entender mejor las diferencias entre las alternativas disponibles.
+
+En este proyecto se estudian fondos cotizados en bolsa (ETF) negociados en Estados Unidos. Se utiliza información diaria entre enero de 2021 y diciembre de 2025. A partir de los precios y el volumen de negociación se construyen cuatro variables: rentabilidad anualizada, volatilidad anualizada, caída máxima y volumen promedio negociado en dólares.
+
+Luego se aplican dos métodos de aprendizaje no supervisado. El Análisis de Componentes Principales (ACP) permite resumir la información y observar cuáles dimensiones explican buena parte de las diferencias entre los activos. K-Means permite formar grupos de ETF que presentan características similares.
+
+El propósito no es afirmar de antemano que existen determinados tipos de activos, sino revisar qué patrones aparecen en los datos y qué significado financiero pueden tener.
+
+## Pregunta de investigación
+
+¿Es posible identificar grupos de ETF con características similares a partir de su rentabilidad, riesgo y volumen de negociación?
+
+## Objetivo general
+
+Analizar diferentes ETF del mercado estadounidense mediante ACP y K-Means para identificar grupos de activos con características similares de riesgo y rendimiento.
+
+## Objetivos específicos
+
+- Recolectar información histórica de diferentes ETF y seleccionar variables relevantes para el análisis.
+- Explorar y preparar los datos para utilizarlos correctamente en los modelos.
+- Aplicar ACP para resumir la información e identificar las dimensiones que explican las diferencias entre los activos.
+- Utilizar K-Means para encontrar grupos de ETF con características similares.
+- Interpretar los resultados desde una perspectiva financiera y reconocer las limitaciones del ejercicio.
+
+# 1. Datos y selección de activos
+
+## 1.1. Fuente de información
+
+Los datos se consultan desde Yahoo Finance mediante el paquete `quantmod` de R. La información utilizada corresponde a precios históricos ajustados y volumen diario. La disponibilidad de los datos depende de la fuente y puede cambiar con el tiempo.
+
+El periodo de estudio va desde el 1 de enero de 2021 hasta el 31 de diciembre de 2025. La fecha final de descarga se fija en el 1 de enero de 2026 porque la función de descarga no incluye el día final del intervalo.
+
+> **Nota sobre el uso de los datos:** este ejercicio tiene fines académicos. Antes de redistribuir los datos descargados o publicarlos dentro de una aplicación, se deben revisar las condiciones de uso de la fuente.
+
+## 1.2. ETF seleccionados
+
+Se propone una selección de ETF que representan distintos segmentos del mercado. Esto permite comparar activos de renta variable, renta fija y materias primas.
+
+```{r seleccion-etf}
+etfs <- c(
+  "SPY", "DIA", "IWM", "QQQ", "XLK",
+  "XLF", "XLE", "XLV", "XLI", "XLP",
+  "XLY", "XLU", "VUG", "VTV", "EFA",
+  "EEM", "TLT", "IEF", "LQD", "GLD"
+)
+
+categorias <- tibble(
+  ETF = etfs,
+  Categoria = c(
+    "Mercado estadounidense", "Mercado estadounidense",
+    "Empresas pequeñas", "Tecnología y crecimiento", "Tecnología",
+    "Finanzas", "Energía", "Salud", "Industria",
+    "Consumo básico", "Consumo discrecional", "Servicios públicos",
+    "Crecimiento", "Valor", "Mercados desarrollados",
+    "Mercados emergentes", "Renta fija largo plazo",
+    "Renta fija mediano plazo", "Bonos corporativos", "Oro"
+  )
+)
+
+knitr::kable(categorias, caption = "ETF incluidos inicialmente en el estudio")
+```
+
+# 2. Descarga y preparación de los datos
+
+## 2.1. Descarga de precios y volumen
+
+Se descarga la información de cada ETF por separado. Si un símbolo no está disponible o la consulta falla, se registra para poder revisar el problema sin detener todo el proceso.
+
+```{r descarga-datos}
+fecha_inicio <- as.Date("2021-01-01")
+fecha_fin <- as.Date("2026-01-01")
+
+precios_lista <- list()
+errores_descarga <- character()
+
+for (ticker in etfs) {
+  resultado <- tryCatch(
+    {
+      quantmod::getSymbols(
+        Symbols = ticker,
+        src = "yahoo",
+        from = fecha_inicio,
+        to = fecha_fin,
+        auto.assign = FALSE,
+        warnings = FALSE
+      )
+    },
+    error = function(e) {
+      errores_descarga[ticker] <<- conditionMessage(e)
+      NULL
+    }
+  )
+
+  if (!is.null(resultado) && NROW(resultado) > 0) {
+    precios_lista[[ticker]] <- resultado
+  }
+}
+
+cat("ETF solicitados:", length(etfs), "\n")
+cat("ETF descargados:", length(precios_lista), "\n")
+cat("ETF con problemas:", length(errores_descarga), "\n")
+
+if (length(errores_descarga) > 0) {
+  print(errores_descarga)
+}
+
+if (length(precios_lista) < 4) {
+  stop("Se descargaron menos de cuatro ETF. Revise la conexión o la disponibilidad de Yahoo Finance e intente nuevamente.")
+}
+```
+
+## 2.2. Cálculo de las variables financieras
+
+Para cada ETF se calculan los rendimientos diarios a partir del precio ajustado. La rentabilidad y la volatilidad se anualizan usando 252 días de negociación como aproximación.
+
+La caída máxima mide la mayor pérdida acumulada desde un máximo anterior. El volumen negociado en dólares se aproxima multiplicando el precio ajustado por el volumen diario y calculando después su promedio.
+
+```{r calculo-variables}
+calcular_indicadores <- function(datos, ticker) {
+
+  precio_ajustado <- quantmod::Ad(datos)
+  volumen <- quantmod::Vo(datos)
+
+  precio_ajustado <- as.numeric(precio_ajustado)
+  volumen <- as.numeric(volumen)
+
+  fechas <- as.Date(index(datos))
+
+  tabla <- tibble(
+    Fecha = fechas,
+    Precio = precio_ajustado,
+    Volumen = volumen
+  ) %>%
+    filter(
+      is.finite(Precio),
+      Precio > 0,
+      is.finite(Volumen),
+      Volumen >= 0
+    )
+
+  rendimientos <- diff(log(tabla$Precio))
+  rendimientos <- rendimientos[is.finite(rendimientos)]
+
+  if (length(rendimientos) < 100) {
+    return(NULL)
+  }
+
+  maximo_acumulado <- cummax(tabla$Precio)
+  caidas <- tabla$Precio / maximo_acumulado - 1
+
+  tibble(
+    ETF = ticker,
+    Rentabilidad = mean(rendimientos) * 252,
+    Volatilidad = sd(rendimientos) * sqrt(252),
+    Max_Drawdown = min(caidas, na.rm = TRUE),
+    Volumen_Dolares = mean(tabla$Precio * tabla$Volumen, na.rm = TRUE),
+    Observaciones = nrow(tabla),
+    Fecha_Inicial = min(tabla$Fecha),
+    Fecha_Final = max(tabla$Fecha)
+  )
+}
+
+base_completa <- purrr::map2_dfr(
+  precios_lista,
+  names(precios_lista),
+  calcular_indicadores
+) %>%
+  left_join(categorias, by = "ETF") %>%
+  select(
+    ETF, Categoria, Rentabilidad, Volatilidad,
+    Max_Drawdown, Volumen_Dolares,
+    Observaciones, Fecha_Inicial, Fecha_Final
+  )
+
+knitr::kable(
+  base_completa,
+  digits = 4,
+  caption = "Indicadores calculados para los ETF descargados"
+)
+```
+
+La rentabilidad se calcula como el promedio de los rendimientos logarítmicos diarios multiplicado por 252. Es una medida anualizada aproximada de la rentabilidad diaria promedio y no equivale al rendimiento acumulado de todo el periodo.
+
+El volumen en dólares también es una aproximación: se calcula con el precio ajustado multiplicado por el número de participaciones negociadas. No debe interpretarse como una medida exacta del dinero efectivamente intercambiado en cada operación.
+
+## 2.3. Revisión de calidad de la base
+
+Antes de continuar, se revisan los datos faltantes, los registros duplicados y la cantidad de observaciones disponibles para cada activo.
+
+```{r revision-calidad}
+cat("Dimensiones de la base:", nrow(base_completa), "filas y",
+    ncol(base_completa), "columnas\n")
+
+cat("\nValores faltantes por variable:\n")
+print(colSums(is.na(base_completa)))
+
+cat("\nETF duplicados:\n")
+print(sum(duplicated(base_completa$ETF)))
+
+cat("\nResumen de observaciones por ETF:\n")
+print(summary(base_completa$Observaciones))
+```
+
+Para los modelos se conservarán las cuatro variables cuantitativas. Los nombres de los ETF y sus categorías se mantendrán para identificar e interpretar los resultados, pero no entrarán directamente en los cálculos.
+
+```{r base-modelo}
+variables_modelo <- c(
+  "Rentabilidad", "Volatilidad",
+  "Max_Drawdown", "Volumen_Dolares"
+)
+
+base_modelo <- base_completa %>%
+  select(ETF, all_of(variables_modelo)) %>%
+  drop_na() %>%
+  filter(if_all(all_of(variables_modelo), is.finite))
+
+if (nrow(base_modelo) < 4) {
+  stop("No hay suficientes ETF con información completa para continuar.")
+}
+
+if (any(sapply(base_modelo[variables_modelo], sd) == 0)) {
+  stop("Al menos una variable no presenta variación. Revise la base antes de continuar.")
+}
+
+cat("ETF disponibles para el análisis:", nrow(base_modelo), "\n")
+```
+
+# 3. Exploración de los datos
+
+## 3.1. Estadísticas descriptivas
+
+Las estadísticas descriptivas permiten observar los valores promedio, la dispersión y los rangos de las variables antes de aplicar los modelos.
+
+```{r descriptivas}
+resumen <- base_modelo %>%
+  select(all_of(variables_modelo)) %>%
+  summarise(
+    across(
+      everything(),
+      list(
+        Media = ~ mean(.x),
+        Mediana = ~ median(.x),
+        Desviacion = ~ sd(.x),
+        Minimo = ~ min(.x),
+        Maximo = ~ max(.x)
+      )
+    )
+  ) %>%
+  pivot_longer(
+    everything(),
+    names_to = c("Variable", "Estadistico"),
+    names_sep = "_(?=[^_]+$)",
+    values_to = "Valor"
+  ) %>%
+  pivot_wider(names_from = Estadistico, values_from = Valor)
+
+knitr::kable(resumen, digits = 4,
+             caption = "Estadísticas descriptivas de las variables")
+```
+
+## 3.2. Comparación visual de los activos
+
+```{r grafico-rentabilidad-volatilidad}
+ggplot(
+  base_completa,
+  aes(x = Volatilidad, y = Rentabilidad, label = ETF, color = Categoria)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray60") +
+  geom_point(size = 3, alpha = 0.85) +
+  geom_text(nudge_y = 0.012, check_overlap = TRUE, size = 3) +
+  labs(
+    title = "Rentabilidad y volatilidad de los ETF",
+    subtitle = "Datos diarios del periodo 2021–2025, anualizados",
+    x = "Volatilidad anualizada",
+    y = "Rentabilidad anualizada aproximada",
+    color = "Categoría"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+Este gráfico permite observar si los ETF con mayor rentabilidad también presentan mayor volatilidad. La relación no tiene que ser necesariamente igual para todos los activos.
+
+## 3.3. Matriz de correlaciones
+
+La correlación muestra qué tan relacionadas están dos variables. Sus valores se encuentran entre -1 y 1. Una relación positiva indica que tienden a moverse en el mismo sentido, mientras que una negativa indica que suelen moverse en sentidos contrarios.
+
+```{r correlaciones}
+matriz_cor <- cor(
+  base_modelo %>% select(all_of(variables_modelo)),
+  use = "complete.obs"
+)
+
+corrplot::corrplot(
+  matriz_cor,
+  method = "color",
+  type = "upper",
+  addCoef.col = "black",
+  tl.col = "black",
+  tl.srt = 35,
+  number.cex = 0.75,
+  title = "Matriz de correlaciones",
+  mar = c(0, 0, 2, 0)
+)
+```
+
+# 4. Estandarización de las variables
+
+Las variables tienen escalas diferentes. Por ejemplo, la rentabilidad y la volatilidad se expresan como proporciones, mientras que el volumen negociado puede tener valores de millones de dólares. Si se utilizaran directamente, la variable con valores numéricamente más grandes podría tener demasiado peso en los cálculos.
+
+Por eso se estandarizan las variables. Este procedimiento transforma cada una para que tenga media cercana a cero y desviación estándar igual a uno.
+
+```{r estandarizacion}
+datos_escalados <- scale(
+  base_modelo %>% select(all_of(variables_modelo))
+)
+
+datos_escalados <- as.data.frame(datos_escalados)
+rownames(datos_escalados) <- base_modelo$ETF
+
+knitr::kable(
+  head(datos_escalados),
+  digits = 3,
+  caption = "Primeras filas de las variables estandarizadas"
+)
+```
+
+# 5. Análisis de Componentes Principales (ACP)
+
+## 5.1. Aplicación del ACP
+
+El ACP permite resumir varias variables en un número menor de componentes. Cada componente combina las variables originales y busca explicar una parte de las diferencias que existen entre los ETF.
+
+```{r modelo-acp}
+modelo_acp <- prcomp(
+  datos_escalados,
+  center = FALSE,
+  scale. = FALSE
+)
+
+varianza <- modelo_acp$sdev^2
+varianza_explicada <- varianza / sum(varianza)
+varianza_acumulada <- cumsum(varianza_explicada)
+
+tabla_varianza <- tibble(
+  Componente = paste0("CP", seq_along(varianza_explicada)),
+  Varianza = varianza_explicada,
+  Varianza_Porcentual = varianza_explicada * 100,
+  Acumulada = varianza_acumulada * 100
+)
+
+knitr::kable(
+  tabla_varianza,
+  digits = 2,
+  caption = "Varianza explicada por cada componente principal"
+)
+```
+
+## 5.2. Gráfico de sedimentación
+
+Este gráfico muestra cuánta variabilidad explica cada componente. También ayuda a observar si llega un punto en el que agregar componentes aporta cada vez menos información.
+
+```{r scree-plot}
+factoextra::fviz_eig(
+  modelo_acp,
+  addlabels = TRUE,
+  ylim = c(0, 100)
+) +
+  labs(
+    title = "Gráfico de sedimentación del ACP",
+    x = "Componentes principales",
+    y = "Porcentaje de varianza explicada"
+  ) +
+  theme_minimal()
+```
+
+## 5.3. Selección del número de componentes
+
+Como criterio inicial se conservará el número de componentes necesario para alcanzar al menos el 80 % de varianza acumulada. Este porcentaje es una regla práctica para orientar la decisión, no una obligación. También se revisará el gráfico de sedimentación y la interpretación de las cargas.
+
+```{r seleccion-componentes}
+numero_componentes <- which(varianza_acumulada >= 0.80)[1]
+
+# Se necesitan al menos dos componentes para representar los datos en un plano.
+numero_componentes <- max(2, numero_componentes)
+
+# No se pueden conservar más componentes que variables disponibles.
+numero_componentes <- min(numero_componentes, ncol(datos_escalados))
+
+cat("Número de componentes seleccionados:", numero_componentes, "\n")
+cat(
+  "Varianza acumulada conservada:",
+  round(varianza_acumulada[numero_componentes] * 100, 2),
+  "%\n"
+)
+```
+
+## 5.4. Interpretación de las cargas
+
+Las cargas permiten observar qué variables tienen mayor relación con cada componente. Se deben analizar sus valores y signos para proponer una interpretación económica o financiera.
+
+```{r cargas-acp}
+cargas <- as.data.frame(modelo_acp$rotation[, 1:numero_componentes])
+cargas$Variable <- rownames(cargas)
+
+cargas <- cargas %>%
+  relocate(Variable)
+
+knitr::kable(
+  cargas,
+  digits = 3,
+  caption = "Cargas de las variables en los componentes seleccionados"
+)
+```
+
+Una carga de mayor valor absoluto indica una relación más fuerte entre la variable y el componente. El signo indica la dirección de esa relación. La interpretación debe hacerse observando todas las variables que participan en cada componente, no una sola de forma aislada.
+
+## 5.5. Representación de las observaciones
+
+Se representan los ETF utilizando los dos primeros componentes. El gráfico muestra una parte de la información original, por lo que se debe leer junto con el porcentaje de varianza que explican esos dos componentes.
+
+```{r grafico-individuos}
+varianza_plano <- sum(varianza_explicada[1:2]) * 100
+
+coordenadas <- as.data.frame(modelo_acp$x[, 1:2])
+coordenadas$ETF <- base_modelo$ETF
+
+ggplot(coordenadas, aes(x = PC1, y = PC2, label = ETF)) +
+  geom_hline(yintercept = 0, color = "gray80") +
+  geom_vline(xintercept = 0, color = "gray80") +
+  geom_point(size = 3, color = "#286090") +
+  geom_text(nudge_y = 0.12, check_overlap = TRUE, size = 3.5) +
+  labs(
+    title = "ETF en el espacio de los dos primeros componentes",
+    subtitle = paste0(
+      "Los dos componentes representan ",
+      round(varianza_plano, 2),
+      "% de la varianza total"
+    ),
+    x = "Primer componente principal",
+    y = "Segundo componente principal"
+  ) +
+  theme_minimal()
+```
+
+# 6. Segmentación mediante K-Means
+
+## 6.1. Preparación para la segmentación
+
+Se aplicará K-Means sobre los componentes seleccionados en el ACP. De esta manera se realiza la segmentación utilizando las dimensiones resumidas de la información.
+
+```{r datos-kmeans}
+datos_cluster <- modelo_acp$x[, 1:numero_componentes, drop = FALSE]
+
+set.seed(123)
+```
+
+## 6.2. Método del codo
+
+El método del codo compara la suma de las distancias al cuadrado entre las observaciones y el centro de su grupo. Se prueban distintos valores de K para observar cuánto mejora la agrupación al aumentar el número de grupos.
+
+```{r metodo-codo}
+k_maximo <- min(8, nrow(datos_cluster) - 1)
+valores_k <- 2:k_maximo
+
+inercia <- purrr::map_dbl(valores_k, function(k) {
+  modelo <- kmeans(
+    datos_cluster,
+    centers = k,
+    nstart = 50,
+    iter.max = 100
+  )
+  modelo$tot.withinss
+})
+
+tabla_codo <- tibble(
+  K = valores_k,
+  Inercia = inercia
+)
+
+knitr::kable(tabla_codo, digits = 2,
+             caption = "Comparación de la inercia para distintos valores de K")
+
+ggplot(tabla_codo, aes(x = K, y = Inercia)) +
+  geom_line() +
+  geom_point(size = 3) +
+  scale_x_continuous(breaks = valores_k) +
+  labs(
+    title = "Método del codo",
+    x = "Número de grupos (K)",
+    y = "Suma de cuadrados dentro de los grupos"
+  ) +
+  theme_minimal()
+```
+
+## 6.3. Coeficiente de silueta
+
+El coeficiente de silueta permite revisar qué tan cerca está cada observación de su propio grupo frente a los demás grupos. En general, un promedio más alto indica una separación más clara.
+
+```{r metodo-silueta}
+distancias <- dist(datos_cluster)
+
+siluetas <- purrr::map_dbl(valores_k, function(k) {
+  modelo <- kmeans(
+    datos_cluster,
+    centers = k,
+    nstart = 50,
+    iter.max = 100
+  )
+
+  sil <- cluster::silhouette(modelo$cluster, distancias)
+  mean(sil[, "sil_width"])
+})
+
+tabla_silueta <- tibble(
+  K = valores_k,
+  Silueta_Promedio = siluetas
+)
+
+knitr::kable(
+  tabla_silueta,
+  digits = 3,
+  caption = "Coeficiente de silueta promedio para distintos valores de K"
+)
+
+ggplot(tabla_silueta, aes(x = K, y = Silueta_Promedio)) +
+  geom_line() +
+  geom_point(size = 3) +
+  scale_x_continuous(breaks = valores_k) +
+  labs(
+    title = "Comparación del coeficiente de silueta",
+    x = "Número de grupos (K)",
+    y = "Silueta promedio"
+  ) +
+  theme_minimal()
+```
+
+## 6.4. Selección del número de grupos
+
+Como punto de partida se selecciona el K que tenga el mayor coeficiente de silueta promedio. Esta decisión se debe contrastar con el método del codo y con la interpretación financiera de los grupos. No se debe escoger un número de grupos solamente porque una métrica lo indique.
+
+```{r seleccion-k}
+k_elegido <- tabla_silueta$K[which.max(tabla_silueta$Silueta_Promedio)]
+
+cat("K seleccionado inicialmente:", k_elegido, "\n")
+cat(
+  "Silueta promedio:",
+  round(max(tabla_silueta$Silueta_Promedio), 3),
+  "\n"
+)
+```
+
+## 6.5. Modelo final de K-Means
+
+```{r modelo-kmeans}
+set.seed(123)
+
+modelo_kmeans <- kmeans(
+  datos_cluster,
+  centers = k_elegido,
+  nstart = 100,
+  iter.max = 100
+)
+
+base_resultados <- base_completa %>%
+  inner_join(
+    base_modelo %>% select(ETF),
+    by = "ETF"
+  ) %>%
+  mutate(
+    Cluster = factor(
+      modelo_kmeans$cluster[
+        match(ETF, base_modelo$ETF)
+      ]
+    )
+  )
+
+knitr::kable(
+  base_resultados %>% select(ETF, Categoria, Cluster),
+  caption = "Grupo asignado a cada ETF"
+)
+```
+
+## 6.6. Visualización de los grupos
+
+```{r grafico-clusters}
+coordenadas_cluster <- as.data.frame(datos_cluster[, 1:2, drop = FALSE]) %>%
+  mutate(
+    ETF = base_modelo$ETF,
+    Cluster = factor(modelo_kmeans$cluster)
+  )
+
+ggplot(
+  coordenadas_cluster,
+  aes(x = PC1, y = PC2, color = Cluster, label = ETF)
+) +
+  geom_point(size = 3.5, alpha = 0.9) +
+  geom_text(nudge_y = 0.12, check_overlap = TRUE, size = 3.2) +
+  labs(
+    title = "Segmentación de ETF mediante K-Means",
+    subtitle = paste("Número de grupos:", k_elegido),
+    x = "Primer componente principal",
+    y = "Segundo componente principal",
+    color = "Grupo"
+  ) +
+  theme_minimal()
+```
+
+El gráfico muestra los grupos en el plano de los dos primeros componentes. Si se conservaron más de dos componentes para K-Means, la segmentación se calculó usando todos los componentes seleccionados, aunque el gráfico solo permita observar dos dimensiones.
+
+# 7. Interpretación financiera de los grupos
+
+La etiqueta numérica de cada grupo no representa una clasificación de mejor a peor. Los grupos deben describirse a partir de las variables originales para entender qué características comparten los ETF que los integran.
+
+## 7.1. Características promedio por grupo
+
+```{r perfil-clusters}
+perfil_clusters <- base_resultados %>%
+  group_by(Cluster) %>%
+  summarise(
+    Cantidad_ETF = n(),
+    Rentabilidad_Promedio = mean(Rentabilidad, na.rm = TRUE),
+    Volatilidad_Promedio = mean(Volatilidad, na.rm = TRUE),
+    Caida_Maxima_Promedio = mean(Max_Drawdown, na.rm = TRUE),
+    Volumen_Promedio_Dolares = mean(Volumen_Dolares, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  perfil_clusters,
+  digits = 4,
+  caption = "Perfil financiero promedio de cada grupo"
+)
+```
+
+## 7.2. ETF que pertenecen a cada grupo
+
+```{r integrantes-clusters}
+integrantes <- base_resultados %>%
+  arrange(Cluster, ETF) %>%
+  select(Cluster, ETF, Categoria)
+
+knitr::kable(
+  integrantes,
+  caption = "Integrantes de cada grupo"
+)
+```
+
+## 7.3. Apoyo para la interpretación
+
+Para describir los grupos se deben comparar sus promedios de rentabilidad, volatilidad, caída máxima y volumen negociado. Por ejemplo, un grupo con volatilidad y caída máxima más altas podría describirse como un grupo de mayor variación y mayores caídas durante el periodo estudiado. Sin embargo, la conclusión debe basarse en los valores que aparezcan en las tablas y no en una descripción definida de antemano.
+
+También es importante revisar si los grupos tienen una separación clara. Si la silueta es baja o hay observaciones cercanas a otros grupos, se debe mencionar que la clasificación tiene límites.
+
+# 8. Conclusiones
+
+Las conclusiones finales se deben escribir después de ejecutar el documento y revisar los resultados reales. Para evitar sacar conclusiones sin evidencia, se dejan a continuación los puntos que se deben completar:
+
+1. **Sobre los datos:** indicar cuántos ETF se descargaron y cuántos quedaron finalmente en el análisis. Mencionar cualquier problema de disponibilidad o calidad encontrado.
+2. **Sobre el ACP:** explicar qué porcentaje de varianza acumulan los componentes seleccionados y qué variables tienen mayor relación con cada uno.
+3. **Sobre K-Means:** señalar cuántos grupos se eligieron y explicar cómo se compararon el método del codo y la silueta.
+4. **Sobre los grupos:** describir las diferencias observadas en rentabilidad, volatilidad, caída máxima y volumen negociado.
+5. **Sobre el alcance:** explicar qué se puede aprender del ejercicio y qué aspectos no se pueden concluir a partir de esta muestra.
+
+## Limitaciones del análisis
+
+Este ejercicio tiene varias limitaciones. En primer lugar, se trabaja con una selección de ETF y no con todos los activos disponibles en el mercado. Además, los resultados dependen del periodo elegido, por lo que los grupos podrían cambiar si se utiliza otro intervalo de tiempo.
+
+Las variables utilizadas resumen algunos aspectos del comportamiento financiero, pero no incluyen todos los factores que pueden influir en una decisión de inversión. Por ejemplo, no se analizan directamente las comisiones, los impuestos, la liquidez en diferentes momentos del mercado ni las necesidades particulares de cada inversionista.
+
+Por último, K-Means siempre asigna cada observación a un grupo, aunque los grupos no estén perfectamente separados. Por eso, los resultados deben entenderse como una herramienta de exploración y no como una recomendación automática de inversión.
+
+# 9. Guardar los resultados
+
+Al finalizar, se guardan las tablas principales para poder utilizarlas después en la aplicación de Streamlit y en el repositorio del proyecto.
+
+```{r exportar-resultados}
+write.csv(
+  base_completa,
+  "base_datos_etf.csv",
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+write.csv(
+  base_resultados,
+  "etf_con_clusters.csv",
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+write.csv(
+  tabla_varianza,
+  "resultados_acp_varianza.csv",
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+write.csv(
+  perfil_clusters,
+  "perfil_financiero_clusters.csv",
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+cat("Archivos CSV exportados en el directorio de trabajo:\n")
+cat("- base_datos_etf.csv\n")
+cat("- etf_con_clusters.csv\n")
+cat("- resultados_acp_varianza.csv\n")
+cat("- perfil_financiero_clusters.csv\n")
+```
+
+# Referencias y herramientas
+
+- Yahoo Finance. Datos históricos de mercado consultados mediante el paquete `quantmod`.
+- R Core Team. Lenguaje y entorno para el análisis estadístico.
+- Documentación de `quantmod`: https://www.quantmod.com/
+- Documentación de `FactoMineR`: https://cran.r-project.org/package=FactoMineR
+- Documentación de `factoextra`: https://cran.r-project.org/package=factoextra
+- Documentación de `cluster`: https://cran.r-project.org/package=cluster
